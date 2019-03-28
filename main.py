@@ -76,6 +76,7 @@ if __name__ == '__main__':
 SYSENC = "cp1255" # System default encoding for safe logging.
 
 import utils as uti
+from pdwan import BmxFrame
 # import Design_FT # Main - once interfaces are added.
 # import Design2_FT # Query.
 import time
@@ -112,6 +113,7 @@ SPRTXT = """char(13) || '---' || char(13)"""
 #QUOTSCP = (r"""‘’‚“”„""","""\'\'\'\"\"\"""")
 HASHDEF = 8 # Number of digits.
 DEFDT = datetime.datetime(1971,1,1)
+TSTMON = pd.date_range("2019-01-01","2019-02-01",closed="left")
 
 LOGMSG = uti.LOGMSG
 LOGMSG.update({
@@ -122,6 +124,11 @@ METHCODES.update({
 "ok": (0,""),
 })
 REVMETHCD = {v[0]: (k,v[1]) for (k,v) in METHCODES.items()}
+uti.FDEFS.update({
+"Gensmp":{"cntid":10,"prvid":None,"dfpid":None,
+          "dfdays":TSTMON,"tmday":"07:00","tmngt":"22:00","uvar":4,
+          "sttday":4,"sttngt":2},
+})
 
 # BM! Defs
 
@@ -161,8 +168,38 @@ def Generate_Samples(vtyp = 1,**parms):
     Ids = 1, stat = 2, vit = 3.
     For stat / vit, send ids for which to generate data,
     and optionally dates."""
-    if vtyp == 1:
-        df = pd.DataFrame()
+    vret = None
+    rund = uti.Default_Dict("Gensmp",parms)
+    if vtyp == 1: # Pid.
+        df = BmxFrame(rcnt = rund["cntid"])
+        if not rund["prvid"]: # Creates new patients randomly.
+            df.Hash_Ids(kout = "pid",indrnd = True)
+        else: # Series of ids for 'guaranteed' randomness.
+            df.index = df.index + rund["prvid"] + 1
+            df.Hash_Ids(kout = "pid",indrnd = False)
+        vret = df
+    elif vtyp == 2: # Status.
+        if rund["dfpid"]: # Currently necessary.
+            dfdays = rund["dfdays"]
+            if not isinstance(dfdays,BmxFrame):
+                kday = "day"
+                dfdays = BmxFrame(dfdays,columns = [kday])
+            else:
+                kday = dfdays.columns[0]
+            df = rund["dfpid"].Cross_Join(dfdays)
+            df["sttday"] = df.Rand_Norm(vstd = rund["sttday"],indint = True)
+            df["sttngt"] = df.Rand_Norm(vstd = rund["sttngt"],indint = True)
+            # Select entry & exit time at edges.
+            # Creep: Chance of none.
+            df["seed"] = df.Rand_Norm(indint = False) # Hours added or negated.
+            df["entry"] = df[kday] + df.Rand_Time()
+            # Periods in between occupy a small fraction of the day.
+            # Method to get the exact quantity - get all nums then divide by total time,
+            # eg 5 7 8 -> 1/4 7/20 2/5. 
+            # Or use np's dirichlet - p1 = relative length, p2 = shape.
+            
+            vret = df
+    return vret
 
 # BM! MAIN()
 def Main_Test():
@@ -186,6 +223,7 @@ def Main_Test():
 #    tstdl = "http://upload.neopets.com/beauty/images/winners/silkmon-2012-05-11.jpg"
     while not indstop:
         if 1 != 0:
+            print(Generate_Samples())
 #             pendtop = imgdb.Select_Recs(vselcols = SELIMGPENDSEL, vwhrcols = SELIMGPENDWHR,
 #                                     vordcols = SELIMGPENDORD, ftc = btc)
 #             imgdb.Kill_Cur(pendtop[1],False) # Locks db for update.
