@@ -90,6 +90,9 @@ import numpy as np
 import inspect
 from collections import OrderedDict # v
 
+pd.set_option("display.width",140)
+pd.set_option("display.max_columns",8)
+
 # import requests
 # from selenium import webdriver
 # from selenium.webdriver.common.keys import Keys
@@ -179,7 +182,7 @@ def Generate_Samples(vtyp = 1,**parms):
             df.Hash_Ids(kout = "pid",indrnd = False)
         vret = df
     elif vtyp == 2: # Status.
-        if rund["dfpid"]: # Currently necessary.
+        if rund["dfpid"] is not None: # Currently necessary.
             dfdays = rund["dfdays"]
             if not isinstance(dfdays,BmxFrame):
                 kday = "day"
@@ -192,12 +195,20 @@ def Generate_Samples(vtyp = 1,**parms):
             # Select entry & exit time at edges.
             # Creep: Chance of none.
             df["seed"] = df.Rand_Norm(indint = False) # Hours added or negated.
-            df["entry"] = df[kday] + df.Rand_Time()
-            # Periods in between occupy a small fraction of the day.
-            # Method to get the exact quantity - get all nums then divide by total time,
-            # eg 5 7 8 -> 1/4 7/20 2/5. 
-            # Or use np's dirichlet - p1 = relative length, p2 = shape.
+            df["tentry"] = (df[kday] +
+                            df.To_Time(rund["tmday"]) +
+                            df.Rand_Time(rund["uvar"]) -
+                            df.To_Time(rund["uvar"]) / 2)
+            df["texit"] = (df[kday] +
+                           df.To_Time(rund["tmngt"]) +
+                           df.Rand_Time(rund["uvar"]) -
+                           df.To_Time(rund["uvar"]) / 2)
+            # Periods in between ought to occupy a small fraction of the day.
+            # Method to get the exact quantity - diri distro with n + 1 items,
+            # such that the first n items represent start times (cumulative),
+            # and the +1 is the exit / entry; then randomly set the break lengths.
             
+            # CONT - create a total size df, then fill keys using a cumsum on counter.
             vret = df
     return vret
 
@@ -223,7 +234,8 @@ def Main_Test():
 #    tstdl = "http://upload.neopets.com/beauty/images/winners/silkmon-2012-05-11.jpg"
     while not indstop:
         if 1 != 0:
-            print(Generate_Samples())
+            dfpid = Generate_Samples(1)
+            print(Generate_Samples(2,dfpid = dfpid))
 #             pendtop = imgdb.Select_Recs(vselcols = SELIMGPENDSEL, vwhrcols = SELIMGPENDWHR,
 #                                     vordcols = SELIMGPENDORD, ftc = btc)
 #             imgdb.Kill_Cur(pendtop[1],False) # Locks db for update.
