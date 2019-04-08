@@ -16,7 +16,11 @@ Notes:
 
 Bugs:
 
-Version log: 
+Version log:
+08/04/19 V0.4 Added period overlap, simple save frame.
+05/04/19 V0.3 Added fill by repetition, expansion.
+03/04/19 V0.2 Added various randomisation methods.
+28/03/19 V0.1 Added basic time utils, cross join, conversion.
 26/03/19 V0.0 New.
 
 """
@@ -46,6 +50,7 @@ import utils as uti
 logger.debug("Start pdwan module")
 
 # BM! Consts
+Deb_Prtlog = lambda x,y = logging.ERROR:uti.Deb_Prtlog(x,y,logger)
 NOTIME = pd.Timedelta(0)
 SEC = pd.Timedelta(1,"s")
 MIN = pd.Timedelta(1,"m")
@@ -73,13 +78,19 @@ MAXTS = 4102444800 # 01/01/2100.
 MINDT = pd.datetime(1970,1,2,2,0) # Below this causes oserr on ts.
 DATETYPE = MINDT.__class__
 TIMETYPE = NOTIME.__class__
-# Keys which are created with a default value when nonexistent.
+# Has keys which are created with a default value when nonexistent.
 # Unlike utils, accepts a variable key as parm (incorporates dview2).
-FDEFS = {
-"Pddiric":{"group":("group",1),"weight":("weight",1)}
-}
+uti.FDEFS.update({
+"Pddiric":{"group":("group",1),"weight":("weight",1)},
+"Pdolap":{"id":"id","tstart":"tstart","tend":"tend","rdur":"rdur",
+          "tseq":None},
+})
+uti.LOGMSG.update({
+"pdsvper": "Could not save frame - file is open: {}",
+})
 BETAPARM = (2,2)
 CHKTYP = 3 # Number of elems to assert dtype.
+FEXT = ".csv"
 
 # BM! Defs
 
@@ -104,7 +115,7 @@ class BmxFrame(pd.DataFrame):
         with the default value per key."""
         if kdef:
             ddef = k
-            for (k,(col,vd)) in FDEFS[kdef].items():
+            for (k,(col,vd)) in uti.FDEFS[kdef].items():
                 indfil = False
                 if k not in ddef:
                     indfil = True
@@ -150,7 +161,7 @@ class BmxFrame(pd.DataFrame):
         Optionally generates 'natural' numbers only,
         which uses symmetric rand, and mu is the min."""
         aseed = np.random.standard_normal(len(self))
-        vret = pd.Series(aseed * vstd)
+        vret = pd.Series(aseed * vstd,index = self.index)
         if indint:
             vret = abs(vret)
         vret = vret + vmu
@@ -187,7 +198,7 @@ class BmxFrame(pd.DataFrame):
         # Though setting both frames to grp idx would suffice for operations,
         # cannot obtain the original index from it.
         ssum.rename("ssum",inplace = True)
-        df2 = df.merge(ssum,left_on = rund["group"],right_index = True)
+        df2 = self.merge(ssum,left_on = rund["group"],right_index = True)
         vret = df2["seed"] / df2["ssum"]
         return vret
     
@@ -234,7 +245,7 @@ class BmxFrame(pd.DataFrame):
 
                 # format = secs, aka unix timestamp. Default is ms.
                 ndt.loc[msk] = pd.to_datetime(odt,unit = "s",errors = "coerce")
-            elif indts < 2:
+            if indts < 2:
                 for rfrmt in REGDATES:
                     # Of the remaining unknown values, attempt conversion.
                     msk = ndt.isnull()
@@ -308,6 +319,7 @@ class BmxFrame(pd.DataFrame):
         with a an additional count col (can be appended to idx later if desired).
         Trick: Create the total size, find and fill the edges using cumsum,
         and fill in between.
+        Handles multiindex idiosyncrasies: inplace doesn't work and 
         Bug: Left merge with left idx + right on yields a messed up index.
         A workaround of left_on = vret.index doesn't yield proper results either.
         Hence, another column needs to be added.
@@ -319,17 +331,85 @@ class BmxFrame(pd.DataFrame):
         vret = BmxFrame(data = 1,index = np.arange(vcnt) + 1,columns = ["sylladex"])
         vret["pdx"] = vret.index  
         vcolsum = vcol.cumsum().astype(int)
-        idxnm = vcolsum.index.name # Should be same as main.
+        if isinstance(vcolsum.index,pd.MultiIndex):
+            idxnm = vcolsum.index.names # Picky.
+        else:
+            idxnm = vcolsum.index.name # Should be same as main.
         if idxnm is None:
             idxnm = "index" # A default.
         vret = vret.merge(vcolsum.reset_index(),how = "left",
                           left_on = "pdx",right_on = vcolsum.name)
-        vret[idxnm].bfill(inplace = True)
+        vret[idxnm] = vret[idxnm].bfill()
         # Int cannot contain nans, and therefore has to be reset after processing.
-        vret[idxnm] = vret[idxnm].astype(vcol.index.dtype)
+        if uti.islstup(idxnm):
+            for i,idx in enumerate(idxnm):
+                # BUG: For some reason, next line lags the debug a step.
+                orgtyp = vcol.index.get_level_values(i).dtype
+                curtyp = vret[idx].dtype
+                if orgtyp != curtyp:
+                    vret[idx] = vret[idx].astype(orgtyp)
+        else:
+            vret[idxnm] = vret[idxnm].astype(vcol.index.dtype)
         vret.set_index(idxnm,inplace = True)
         vret["sylladex"] = vret.groupby(vret.index)["sylladex"].cumsum()
         return BmxFrame(vret["sylladex"])
+    
+    def Period_Overlap(self,**parms):
+        """Merges period rows whose times overlap.
+        
+        Valid parms are id (group, never merged), tstart and tend, rdur -
+        all are col names.
+        Opt: tseq = Will merge nigh consecutive recs, within certain timespan.
+        Expects the frame to be sorted by id + start.
+        Returns the full data from the last row in each overlap, arbitrarily.
+        Explanation: for each row checks if start is within range of greatest end,
+        up to prev row (notwithstanding id); if so, then merge it.
+        The group boundaries are defined, earliest start propagated to each,
+        and the last of each is filtered.
+        Given list of ids, they are treated as a composite key."""
+        rund = uti.Default_Dict("Pdolap",parms)
+        if not uti.islstup(rund["id"]):
+            rund["id"] = [rund["id"]]
+        self["firstrec"] = np.any([self[k] != self[k].shift(1)
+                                   for k in rund["id"]],axis = 0)
+        self["lastrec"] = np.any([self[k] != self[k].shift(-1)
+                                  for k in rund["id"]],axis = 0)
+        # List seems to suffice.
+#         else:
+#             # Single col has dim 1 which np flattens,
+#             # so must either convert to frame or separate.
+#             self["firstrec"] = self[rund["id"]] != self[rund["id"]].shift(1)
+#             self["lastrec"] = self[rund["id"]] != self[rund["id"]].shift(-1)
+        self["group"] = self["firstrec"].astype(int).cumsum()
+        self["tmaxend"] = self.groupby("group")[rund["tend"]].cummax()
+        if rund["tseq"] is None: # Must be nonzero overlap.
+            self["indmrg"] = (self[rund["tstart"]].shift(-1) >
+                              self["tmaxend"])
+        else:
+            self["indmrg"] = (self[rund["tstart"]].shift(-1) >
+                              self["tmaxend"] + self.To_Time(rund["tseq"],"s"))
+        self.loc[self["lastrec"],"indmrg"] = True
+        self["indmrg2"] = self["indmrg"].shift(1) # First rec of each group.
+        self["indmrg2"].fillna(True,inplace = True)
+        self["group"] = self["indmrg2"].cumsum()
+        self["tminstart"] = self.groupby("group")[rund["tstart"]].cummin() # Alt: First.
+        vret = self[self["indmrg"]].copy()
+        vret[rund["tstart"]] = vret["tminstart"]
+        vret[rund["tend"]] = vret["tmaxend"]
+        vret[rund["rdur"]] = vret[rund["tend"]] - vret[rund["tstart"]]
+        return BmxFrame(vret)
+    
+    def Save_Frame(self,fdir):
+        """Save frame to file.
+        
+        Creep: Fix date, time, float formatting."""
+        if not fdir.endswith(FEXT):
+            fdir = fdir + FEXT
+        try:
+            self.to_csv(fdir)
+        except PermissionError:
+            Deb_Prtlog(uti.LOGMSG["pdsvper"].format(fdir),logging.WARN)
+        return 0
     
 # Checks whether imported.
 if __name__ == '__main__':
@@ -356,7 +436,17 @@ if __name__ == '__main__':
     #df2 = BmxFrame(index = [0.1,0.2,0.3])
     df2["addcnt"] = np.arange(len(df2)) + 1
     df2a = df2.Expandong("addcnt")
-    print("Added rows:\n",df2a) 
+    print("Added rows:\n",df2a)
+    df3 = BmxFrame(rcnt = 10)
+    df3["id"] = [10] * 5 + [20] * 5
+    df3["tstart"] = (df3.To_Date(["2010-01-01 15:55:00"] * 8 +
+                                 ["2010-01-01 16:00:00"] + 
+                                 ["2010-01-01 16:47:00"]) + df3.index * MIN)
+    df3["tend"] = (df3.To_Date(["2010-01-01 16:55:00"] * 8 +
+                               ["2010-01-01 16:55:30"] +
+                               ["2010-01-01 17:00:00"]))
+    df3a = df3.Period_Overlap(id = "id")#,tseq = df3.To_Time(30,"s"))
+    print("Overlap merge:\n",df3a[["id","tstart","tend","rdur"]])
     print("\nFin")
 else:
     pass

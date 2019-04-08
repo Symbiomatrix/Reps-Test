@@ -71,12 +71,13 @@ if __name__ == '__main__':
     #                     format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
     logging.basicConfig(filename=LOGFLD,
                         level=logging.WARN, # Prints to a file. Should be utf. #.warn
-                        format="%(asctime)s %(levelname)s:%(name)s:%(message)s") # Adds timestamp.
+                        format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
     logger.setLevel(logging.DEBUG)
 SYSENC = "cp1255" # System default encoding for safe logging.
 
 import utils as uti
-from pdwan import BmxFrame
+import pdwan as pdu
+BmxFrame = pdu.BmxFrame
 # import Design_FT # Main - once interfaces are added.
 # import Design2_FT # Query.
 import time
@@ -117,6 +118,9 @@ SPRTXT = """char(13) || '---' || char(13)"""
 HASHDEF = 8 # Number of digits.
 DEFDT = datetime.datetime(1971,1,1)
 TSTMON = pd.date_range("2019-01-01","2019-02-01",closed="left")
+NARCOLEPSY = 0.5 * pdu.HOUR # Max time for rest / wake (uniform distro).
+INSOMNIA = pdu.HOUR # They may still be merged to a longer period.
+GENRULER2 = ["pid","day","sylladex","ostatus","ostart","oend","rdur"]
 
 LOGMSG = uti.LOGMSG
 LOGMSG.update({
@@ -165,6 +169,45 @@ def DebP_Select(seldb,ftc = 1000):
         tdiff = uti.Ed_Timer("Dbprint")
         logger.debug("Batch {} time: {}".format(i,tdiff))
         
+def Status_Times(vtyp,df,kday):
+    """Create status start + end along the day.
+    
+    1 = narcolepsy from morn to night.
+    2 = insomnia from night to next morn."""
+    if vtyp == 1:
+        kcnt = "sttday"
+        kfrom = "twake"
+        kto = "tsleep"
+        nstat = 4
+        mxdur = NARCOLEPSY
+    elif vtyp == 2:
+        kcnt = "sttngt"
+        kfrom = "tsleep"
+        kto = "tnwake"
+        nstat = 5
+        mxdur = INSOMNIA
+    df["newrow"] = df[kcnt] + 1
+    dfst = df.Expandong("newrow")
+    # Multiindex is inconvenient as hell. There's groupby level,
+    # but it's more statistical. Cannot seem to shift it directly.
+    dfst["twake"] = df["twake"]
+    dfst["tnwake"] = df["tnwake"]
+    dfst["tsleep"] = df["tsleep"]
+    dfst.reset_index(inplace = True)
+    dfst["firstrec2"] = ((dfst["pid"] != dfst["pid"].shift(1)) |
+                         (dfst[kday] != dfst[kday].shift(1)))
+    dfst["lastrec2"] = ((dfst["pid"] != dfst["pid"].shift(-1)) |
+                         (dfst[kday] != dfst[kday].shift(-1)))
+    dfst["grp2"] = dfst["firstrec2"].cumsum()
+    dfst["raindeer"] = dfst.Rand_DirichletG(group = "grp2")
+    dfst["crane"] = dfst.groupby(dfst["grp2"])["raindeer"].cumsum()
+    dfst["tdiff"] = dfst[kto] - dfst[kfrom]
+    dfst["ostart"] = dfst[kfrom] + dfst["crane"] * dfst["tdiff"]
+    dfst["ostatus"] = nstat
+    dfst["rdur"] = dfst.Rand_Time(ubnd = mxdur)
+    dfst["oend"] = dfst["ostart"] + dfst["rdur"]
+    return dfst
+
 def Generate_Samples(vtyp = 1,**parms):
     """Creates a frame of ids, statuses or vitals.
     
@@ -183,7 +226,7 @@ def Generate_Samples(vtyp = 1,**parms):
         vret = df
     elif vtyp == 2: # Status.
         if rund["dfpid"] is not None: # Currently necessary.
-            dfdays = rund["dfdays"]
+            dfdays = rund["dfdays"] # Pid should not be a key.
             if not isinstance(dfdays,BmxFrame):
                 kday = "day"
                 dfdays = BmxFrame(dfdays,columns = [kday])
@@ -195,21 +238,44 @@ def Generate_Samples(vtyp = 1,**parms):
             # Select entry & exit time at edges.
             # Creep: Chance of none.
             df["seed"] = df.Rand_Norm(indint = False) # Hours added or negated.
-            df["tentry"] = (df[kday] +
+            df["twake"] = (df[kday] +
                             df.To_Time(rund["tmday"]) +
                             df.Rand_Time(rund["uvar"]) -
                             df.To_Time(rund["uvar"]) / 2)
-            df["texit"] = (df[kday] +
+            df["tsleep"] = (df[kday] +
                            df.To_Time(rund["tmngt"]) +
                            df.Rand_Time(rund["uvar"]) -
                            df.To_Time(rund["uvar"]) / 2)
+            df["lastrec"] = df["pid"] != df["pid"].shift(-1)
+            df["tnwake"] = df["twake"].shift(-1) # Used in random later.
+            df.loc[df["lastrec"],"tnwake"] = df["twake"] + pdu.DAY # Estimated.
             # Periods in between ought to occupy a small fraction of the day.
             # Method to get the exact quantity - diri distro with n + 1 items,
             # such that the first n items represent start times (cumulative),
-            # and the +1 is the exit / entry; then randomly set the break lengths.
-            
-            # CONT - create a total size df, then fill keys using a cumsum on counter.
-            vret = df
+            # and the +1 is the sleep / wake; then randomly set the break lengths.
+            # Crossjoin resets (wipes) keys, have to prepare them for expansion.
+            df.set_index(["pid",kday],inplace = True)
+            df["newrow"] = df["sttday"] + 1 
+            dfst1 = Status_Times(1,df,kday)
+            dfst2 = Status_Times(2,df,kday)
+            dfstat = pd.concat([dfst1,dfst2])
+            dfstat.sort_values(["pid",kday,"ostart"],inplace = True)
+            dfstat["lastrec"] = (dfstat["pid"] != dfstat["pid"].shift(-1))
+            # Day's end / beginning is expanded, up to next record.
+            # Inner wakings / rests still need to be filled with more records.
+            # Bools don't work with shift due to nans.
+            dfstat["nstart"] = dfstat["ostart"].shift(-1)
+            dfstat.loc[dfstat["lastrec2"],"oend"] = (
+                dfstat.loc[dfstat["lastrec2"],"nstart"])
+            dfstat.loc[dfstat["lastrec"],"oend"] = (
+                dfstat.loc[dfstat["lastrec"],"tnwake"])
+            dfstat.loc[dfstat["lastrec2"],"rdur"] = (
+                dfstat.loc[dfstat["lastrec2"],"oend"] -
+                dfstat.loc[dfstat["lastrec2"],"ostart"])
+            dfstat = dfstat.Period_Overlap(id = ["pid","ostatus"],tstart = "ostart",
+                                           tend = "oend",rdur = "rdur")
+                        
+            vret = BmxFrame(dfstat[GENRULER2])
     return vret
 
 # BM! MAIN()
@@ -235,9 +301,9 @@ def Main_Test():
     while not indstop:
         if 1 != 0:
             dfpid = Generate_Samples(1)
-            print(Generate_Samples(2,dfpid = dfpid))
-#             pendtop = imgdb.Select_Recs(vselcols = SELIMGPENDSEL, vwhrcols = SELIMGPENDWHR,
-#                                     vordcols = SELIMGPENDORD, ftc = btc)
+            dfpid.Save_Frame("test_pid.csv")
+            dfstat = Generate_Samples(2,dfpid = dfpid)
+            dfstat.Save_Frame("test_stat.csv")
 #             imgdb.Kill_Cur(pendtop[1],False) # Locks db for update.
 # Compare req-selena.
 #             tsturl = r"https://archive.help-qa.com/history/few-replies//8"
@@ -251,7 +317,6 @@ def Main_Test():
 #             galena.quit()
 # Find test.
 #             tstt = Find_Loop_Repl("""One of you, "ladies'""","s{punc}",1, False, 0)
-#             tstt = Find_Loop_Repl(Load_Dummy(1),"""class={punc}ipsDataItem """,1, False, 133541)
 #             print(tstt)
 # Dummy.
 #            verr = Build_Crawl(dbrefs,btc,ddl)
@@ -274,7 +339,8 @@ def Main_Test():
     
     tdiff = uti.Ed_Timer("Main")
     print("\nFin.")
-    logger.debug("End Main_FT {}".format(tdiff)) # Remember that timestamp is automatic in logger.
+    # Remember that timestamp is automatic in logger.
+    logger.debug("End main {}".format(tdiff))
     
     return verr
 
@@ -282,7 +348,7 @@ def Main():
     """Activates function calls.
     
     Main."""
-    Deb_Prtlog("Start Main_FT",logging.DEBUG)
+    Deb_Prtlog("Start main",logging.DEBUG)
     uti.St_Timer("Main")
     
     verr = 0
@@ -299,7 +365,8 @@ def Main():
     
     tdiff = uti.Ed_Timer("Main")
     print("\nFin.")
-    logger.debug("End Main_FT {}".format(tdiff)) # Remember that timestamp is automatic in logger.
+    # Remember that timestamp is automatic in logger.
+    logger.debug("End main {}".format(tdiff))
     if verr == 0:
         uti.Msgbox(LOGMSG["mainok"],"Good morning chrono")
     else:
