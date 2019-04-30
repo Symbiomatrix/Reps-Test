@@ -17,6 +17,8 @@ Notes:
 Bugs:
 
 Version log:
+30/04/19 V0.6 Added group (max row) selection, date + time type format, partial fillna.
+20/04/19 V0.5 Added cooldown.
 08/04/19 V0.4 Added period overlap, simple save frame.
 05/04/19 V0.3 Added fill by repetition, expansion.
 03/04/19 V0.2 Added various randomisation methods.
@@ -45,6 +47,7 @@ BADLOG = "Utilog-d{}.txt"
 
 import numpy as np
 import pandas as pd
+import re
 import utils as uti
 
 logger.debug("Start pdwan module")
@@ -54,7 +57,9 @@ Deb_Prtlog = lambda x,y = logging.ERROR:uti.Deb_Prtlog(x,y,logger)
 NOTIME = pd.Timedelta(0)
 SEC = pd.Timedelta(1,"s")
 MIN = pd.Timedelta(1,"m")
+MIN2 = 60
 HOUR = pd.Timedelta(1,"h")
+HOUR2 = 60 * MIN2
 DAY = pd.Timedelta(1,"d")
 LITESTR = "\'{}\'" # Extra date conversion.
 REGDATES = [ # Regular datetime formats.
@@ -78,12 +83,18 @@ MAXTS = 4102444800 # 01/01/2100.
 MINDT = pd.datetime(1970,1,2,2,0) # Below this causes oserr on ts.
 DATETYPE = MINDT.__class__
 TIMETYPE = NOTIME.__class__
+PDDTDTYP = "datetime"
+PDTMDTYP = "timedelta"
+EPS = sys.float_info.epsilon
 # Has keys which are created with a default value when nonexistent.
 # Unlike utils, accepts a variable key as parm (incorporates dview2).
 uti.FDEFS.update({
 "Pddiric":{"group":("group",1),"weight":("weight",1)},
 "Pdolap":{"id":"id","tstart":"tstart","tend":"tend","rdur":"rdur",
           "tseq":None},
+"Pdmaxr":{"group":None,"maxcol":"maxcol","func":"idxmax","flocs":[],"fparms":dict()},
+"Pdtrigcd":{"cdur":MIN,"group":None,"tstamp":"tstart", # Also kin.
+            "pgroup":None,"pcd":NOTIME,"ptstamp":MINDT},
 })
 uti.LOGMSG.update({
 "pdsvper": "Could not save frame - file is open: {}",
@@ -91,21 +102,168 @@ uti.LOGMSG.update({
 BETAPARM = (2,2)
 CHKTYP = 3 # Number of elems to assert dtype.
 FEXT = ".csv"
+GRPIDX = {"head","tail"} # Group functions which return the original index as index.
+# Compare to eg idxmax, which leaves the group intact and value is the index.
+DCOOL = dict()
 
 # BM! Defs
+
+def Appcd(drow): #,**parms)
+    """Applies cooldown to sets of rows.
+    
+    Retains the previous col vals and cooldown,
+    using a global dict.
+    Kwargs by spec are shallow copied (mostly thread safe),
+    and thus improper for use in its place -
+    reliance on inner mutable object is shoddy.
+    Amongst them cd length, current cd, previous + name of groups and timestamp.
+    Alt: Group and time cols can be shifted ahead rather than stored,
+    but that's prolly space inefficient and pointless since cd isn't vectorised."""
+    global DCOOL
+    parms = DCOOL
+    vret = drow[parms["kin"]]
+    if vret:
+        if (parms["pgroup"] == drow[parms["group"]]).all(): # Completely same group.
+            ctime = drow[parms["tstamp"]]
+            parms["pcd"] = max(NOTIME,parms["pcd"] - (ctime - parms["ptstamp"]))
+        else: # Different group, cd irrelevant.
+            parms["pcd"] = NOTIME
+        if parms["pcd"] > NOTIME: # Still in cd, switch.
+            #drow[parms["kin"]] = False
+            vret = False
+        else:
+            parms["pcd"] = parms["cdur"]
+        parms["pgroup"] = drow[parms["group"]]
+        parms["ptstamp"] = drow[parms["tstamp"]]
+
+    print("Latest iter:",parms)
+    return vret
+
+def App_Strftime(dcol,repnull = "",*lparms,**parms):
+    """Used to apply strftime to multiple series in frame.
+    
+    Alt: Loop over the rows and use use dt. Not sure of efficiency.
+    The copy just suppresses an annoying warning."""
+    vret = dcol.dt.strftime(*lparms,**parms).copy()
+    if repnull is not None:
+        vret.loc[dcol.isna()] = repnull
+    return vret
+
+def Delim_Format(matchobj,schr = "%"):
+    """Surrounds an item with format compatible brackets, with escaping.
+    
+    The special char should be caught by regex as well.
+    Handling this without a function is complex - lookahead, lookbehind,
+    cases like %%A and %%%A and %%%.
+    Since re doesn't forward parms, use a lambda to set schr."""
+    if matchobj.group(1) == schr: # Special char escaped.
+        return matchobj.group(1)
+    else:
+        # To clarify, the external 2 pairs are escaped.
+        return "{{{obj}}}".format(obj = matchobj.group(1))
+
+def App_Strfdelta(dcol,date_format,repnull = ""):
+    """Used to apply a format to timedeltas in frame.
+    
+    That's not an actual thing, but with template,
+    it's possible to access some attributes via a letter.
+    Available components: days, hours, minutes, seconds,
+    milliseconds, microseconds, nanoseconds.
+    Dunno how those work, and milliseconds is absent as an attr.
+    There's a string.template thing for this sort formatting using %,
+    but it's a bit of a hassle to set up.
+    Creep: Read format directly, put precise remainder on lowest denomination -
+    for example, weeks + days and partial day."""
+    d = BmxFrame({"D":dcol.dt.days})
+    d["H"],rem = divmod(dcol.dt.seconds,HOUR2)
+    d["M"],d["S"] = divmod(rem,MIN2)
+    #d["L"] = drow.dt.milliseconds # Does not exist?
+    d["C"] = dcol.dt.microseconds
+    d["N"] = dcol.dt.nanoseconds
+    d["s"] = dcol.dt.total_seconds()
+    stdfmt = re.sub("%(.)",lambda x: Delim_Format(x,schr = "%"),date_format)
+    # Displaying either zeroes or empty seems fine by me.
+    vret = d.Col_Format(stdfmt,True,"0")
+    if repnull is not None:
+        vret.loc[d["s"].isna()] = repnull
+    return vret
+
+def App_Format(drow,fmt,indcast = False,nullstr = None):
+    """Given a row of mixed types: downcasts ints, renames nulls and formats as str.
+    
+    There are 2 stages to downcast: first, filter out nulls and nonnumbers;
+    the former doesn't exist in int (error) and latter cannot be cast (error).
+    Then, check if the number if within floating range of the whole.
+    Cannot mix types in np, so result is returned as dict.
+    Note that numeric cols sometimes return null rather than true,
+    unlike strings containing numbers.
+    Unfortunately, strings don't have a float check function.
+    Elemwise advice is to try-catch cast to float, but astype only has ignore,
+    which leaves the value (and type) as str.
+    Opted to simulate a part of float cast (sans scientific notation,
+    which permits num-e-int)."""
+    dictrow = drow.to_dict()
+    if indcast:
+        chknum = (drow.astype(str).str.replace(".","",n = 1)
+                  .str.lstrip("+-").str.isnumeric())
+        #chknum = drow.astype(str).str.isnumeric()
+        flt = drow[(chknum.isna() | chknum) &
+                    ~drow.isna()]
+        flt2 = flt[abs(flt.astype(float) - flt.astype(int)) <= EPS]
+        flt2 = flt2.astype(int)
+        dictflt = flt2.to_dict()
+        dictrow.update(dictflt)
+    if nullstr is not None:
+        flt = drow[drow.isna()]
+        flt[:] = nullstr
+        dictflt = flt.to_dict()
+        dictrow.update(dictflt)
+    return fmt.format(**dictrow)
 
 class BmxFrame(pd.DataFrame):
     """Dataframe with some tricky methods.
     
-    Spam."""
+    Overrides some default method output for convenience, then come tricks.
+    (This may be possible to do dynamically via list + setattr in a loop,
+    but I'm not sure that would fit the compilation.)"""
     def __init__(self,*lparms,**parms):
         """Init with additional empty row option.
         
-        Gets both list and dict to inherit positional as is."""
+        Gets both list and dict to inherit positional as is.
+        Creep: If df, should prolly not call parent which might implicitly copy.
+        But not sure how to create the link without a ref attribute."""
         if "rcnt" in parms:
             parms["index"] = np.arange(parms["rcnt"])
             parms.pop("rcnt")
         super().__init__(*lparms,**parms)
+        
+    def reset_index(self,*lparms,**parms):
+        "Override."
+        return BmxFrame(super().reset_index(*lparms,**parms))
+    
+    def set_index(self,*lparms,**parms):
+        "Override."
+        return BmxFrame(super().set_index(*lparms,**parms))
+    
+    def merge(self,*lparms,**parms):
+        "Override."
+        return BmxFrame(super().merge(*lparms,**parms))
+        
+    def copy(self,*lparms,**parms):
+        "Override."
+        return BmxFrame(super().copy(*lparms,**parms))
+    
+    def fillna(self,value,*lparms,**parms):
+        """Override plus support for value = list.
+        
+        In order to fill part of the frame with differing vals,
+        parent expects value = dict."""
+        # Worse alts (prolly create a copy):
+        # df[cols] = df.fillna(cols)
+        # df.fillna({c:0 for c in cols},inplace = True)
+        if uti.islstup(value): # Format: First is fill val, rest are cols.
+            value = {c:value[0] for c in value[1:]}
+        return BmxFrame(super().fillna(value,*lparms,**parms))
         
     def Get_Key(self,k,kdef = None):
         """Get key from frame, or use as series.
@@ -135,6 +293,28 @@ class BmxFrame(pd.DataFrame):
             except (KeyError,ValueError): # As series object.
                 return pd.Series(k,index = self.index)
         
+    def Get_Group(self,k,defall = False):
+        """Returns list of index / multiindex names or group cols.
+        
+        Small transference func.
+        Also resets index for access if necessary."""
+        if k is None:
+            if isinstance(self.index,pd.MultiIndex):
+                idxnm = self.index.names
+            else:
+                idxnm = self.index.name
+            df = self.reset_index()
+            if idxnm is None:
+                idxnm = "index" # A default.
+                if defall: # Treats all rows as either single group, or separate.
+                    df[idxnm] = 1
+        else:
+            df = self
+            idxnm = k
+        if not uti.islstup(idxnm):
+            idxnm = [idxnm]
+        return (idxnm,df)
+        
     def Hash_Ids(self,kout = "hshid",indrnd = True):
         """Creates hashed ids for the frame, inplace.
         
@@ -153,7 +333,7 @@ class BmxFrame(pd.DataFrame):
         Aka cartesian product for all you nerds."""
         self["fakey"] = 0 # Same key for all rows.
         df2["fakey"] = 0
-        return BmxFrame(self.merge(df2,on = "fakey",**parms))
+        return self.merge(df2,on = "fakey",**parms)
     
     def Rand_Norm(self,vmu = 0,vstd = 1,indint = False):
         """Gaussian distribution with mu and std.
@@ -411,6 +591,110 @@ class BmxFrame(pd.DataFrame):
             Deb_Prtlog(uti.LOGMSG["pdsvper"].format(fdir),logging.WARN)
         return 0
     
+    def Translate_Values(self,kin,dtrans):
+        """Translate values based on dict.
+        
+        Key = original value, value = translated. Nothing fancy."""
+        vcol = self.Get_Key(kin)
+        return vcol.map(dtrans)
+    
+    def Group_Rows(self,**parms):
+        """Creates a frame with the rows whose value is greatest (and others).
+        
+        Parms: group = col per each max applied,
+        maxcol = col which is supposed to be maxed,
+        func + *flocs + **fparms = the comparison method.
+        (must return indices, such as idxmax, idxmin, head.)
+        Group defaults to index, but if there isn't one then picks global max.
+        Mind, df must *not* be keyed in order for idxmax to work
+        (mayhap iloc would suffice), other than def.
+        It's just used as a col and the group later
+        assimilates it to the unique frame (keyed)."""
+        rund = uti.Default_Dict("Pdmaxr",parms)
+        if not uti.islstup(rund["flocs"]):
+            rund["flocs"] = [rund["flocs"]]
+        # Single parm can be converted, but non dict would require keys.
+        (idxnm,df) = self.Get_Group(rund["group"],defall = True)
+        # Drop dupes is the frame equiv of series.unique.
+        # Though I don't actually need it, unless appending cols.
+        #vret = BmxFrame(df[idxnm].drop_duplicates(),columns = idxnm)
+        #vret.set_index(idxnm,inplace = True)
+        tidx = df.groupby(idxnm)[rund["maxcol"]]
+        func = getattr(tidx,rund["func"])
+        tidx = func(*rund["flocs"],**rund["fparms"])
+        if rund["func"] in GRPIDX:
+            tidx = tidx.index
+        tgrp = df.loc[tidx]
+        tgrp.set_index(idxnm,inplace = True)
+        vret = tgrp
+        #vret[newcol] = tgrp # Append method.
+        
+        return vret
+    
+    def Trigger_Cooldown(self,kin,**parms):
+        """Applies cooldown to a boolean col.
+        
+        In col kin, will leave only the first indication on
+        for every series of length cdur (important);
+        based on time from col tstamp (p) and treating group (p) as separate.
+        Def group is the index. Should be sorted by group-tstamp.
+        This is a SLOW function, resorting to apply,
+        yet potentially hastened vastly by filtering positive rows only.
+        Since order is expected, apply might not be the best choice over loop,
+        seemed pretty safe in my experiments however."""
+        global DCOOL
+        rund = uti.Default_Dict("Pdtrigcd",parms)
+        rund["kin"] = kin
+        (idxnm,df) = self.Get_Group(rund["group"],defall = True)
+        rund["group"] = idxnm
+        df = BmxFrame(df.loc[df[kin]]) # Cont: Does it create a copy?
+        #func = lambda x: Appcd(x,**rund) # Kwargs creates a fresh copy regardless.
+        DCOOL = dict()
+        DCOOL.update(rund)
+        vret = self[kin].copy()
+        # In frame, a set clause works, but in series that creates a new row.
+        cdblock = df.apply(Appcd,axis = 1)
+        if len(cdblock) > 0: # Empty frame => no triggers.
+            #vret[kin] = cdblock # Frame only.
+            vret.update(cdblock) # Series only.
+        return vret
+    
+    def Type_Format(self,fmtdate = None,fmttime = None,repnull = ""):
+        """Reformats all cols of certain type inplace.
+        
+        This can be used for example in to_csv or to_json:
+        there is a date_format and date_unit respectively,
+        but both accept only specific values, like iso / epoch,
+        and nulls lack variation (translated to text None).
+        Creep: Float format."""
+        # CONT: null handle.
+        if fmtdate is not None:
+            subcols = self.select_dtypes(PDDTDTYP)
+            # Alt: self[subcols.columns] seems to work just fine.
+            self.loc[:,self.columns.isin(subcols.columns)] = (
+                subcols.apply(App_Strftime,date_format = fmtdate,repnull = repnull))
+        
+        if fmttime is not None:
+            subcols = self.select_dtypes(PDTMDTYP)
+            self.loc[:,self.columns.isin(subcols.columns)] = (
+                subcols.apply(App_Strfdelta,date_format = fmttime,repnull = repnull))
+    
+    def Col_Format(self,fmt,indcast = False,nullstr = None):
+        """Creates a column of a string format.
+        
+        The frame's columns may be referenced by name, ie {col}.
+        Trick is to apply by row, and unpack its cols to dict.
+        Caveat: During apply, integers are instantly degraded to floats.
+        In a colwise setting, this could be fixed by checking type
+        (col.dtype == float) and then value (col == col.astype(int).all()),
+        but in a row series the type is singular for all vals,
+        some of which may actually be float.
+        As such, created a special format function which also downcasts conditionally,
+        upon request - additional conversion to dict may delay the process a bit.
+        Additionally, formatter converts nan / nat to strings."""
+        return self.apply(App_Format,1,fmt = fmt,indcast = indcast,nullstr = nullstr)
+        #return self.apply(lambda x:fmt.format(**x),1)
+    
 # Checks whether imported.
 if __name__ == '__main__':
     print("hello world")
@@ -447,6 +731,32 @@ if __name__ == '__main__':
                                ["2010-01-01 17:00:00"]))
     df3a = df3.Period_Overlap(id = "id")#,tseq = df3.To_Time(30,"s"))
     print("Overlap merge:\n",df3a[["id","tstart","tend","rdur"]])
+#     df3b = df3.set_index(["id","tend"]).Group_Rows(maxcol = "tstart")
+    df3b = df3.Group_Rows(group = ["id","tend"],maxcol = "tstart",
+                          func = "head",flocs = 2)
+    print("Max merge:\n",df3b)
+    df3["boolsheep"] = False
+    df3.loc[0:6,"boolsheep"] = True
+    df3["trig"] = df3.Trigger_Cooldown("boolsheep",cdur = 2 * MIN,
+                                       group = None) # Any of ["tstart","id","group"].
+    print("TRIGGERED:\n",df3[["id","tstart","boolsheep","trig"]])
+    df4 = df3.copy()
+    df4["partial"] = np.floor(df4.Rand_Norm() * 5)
+    df4.loc[0,"partial"] = pd.NaT
+    df4.loc[3,"partial"] = pd.NaT
+    # Bug: When value contains nulls, mean raises an exception (unlike sum / cnt).
+    # I also mentioned another one when "id lacks some rows", dunno what that was.
+    # print("Dataerror:",df4.groupby("id")["partial"].mean())
+    df4["tdur"] = df4["tend"] - df4["tstart"]
+    # Bug: This also fails, for no good reason. Average time is a legitimate detail.
+    # print("Dataerror:",df4.groupby("id")["tdur"].mean())
+    df4.fillna([1.5,"trig","id"],inplace = True)
+    #df4.fillna({"id":2,"partial":1.5},inplace = True)
+    df4.loc[0,"tdur"] = pd.NaT
+    df4.loc[3,"tend"] = pd.NaT
+    df4.loc[6,"tdur"] = df4.loc[6,"tdur"] - 53914 * SEC
+    df4.Type_Format("%y%m%d %H%M%S","%D days, %H hours, %M:%S",None)
+    print("Datetime format:\n",df4[["id","tstart","tend","tdur"]])
     print("\nFin")
 else:
     pass
