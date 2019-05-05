@@ -8,6 +8,7 @@ Created on 16/12/17
 @purpose: General utilities. 
 
 Version log (incrementing on imports):
+30/04/19 V8.2 Added ellipsis replacement.
 24/03/19 V8.1 Added hash str and digits (any basic object).
 23/03/19 V8.0 Forked to repstest. Added viewdict methods.
 09/10/18 V7.9 Added suffix strip.
@@ -1265,10 +1266,13 @@ def Hash_Str(vlong,chrs = HASHDEF,indasc = 1):
     """Create hashed string from value.
     
     Accepts str, dict or other json interpretable object.
+    Json is necessary to enforce order in eg dicts.
     Note that json dumps numbers adequately.
     Bytearrays have a decode method, but it fails for non strings.
     Since the hash value is not shown, preferred to pick uniform distro
-    over a mod approach (which maps the first values correctly)."""
+    over a mod approach (which maps the first values correctly).
+    Other forms of hash are sha1, sha2, md5 - less secure.
+    Can be used as function cache under filename - pass the parms dict."""
     if isstr(vlong):
         vhash = hashlib.sha256(vlong.encode('utf-8')).hexdigest()
     else: # Dict.
@@ -1306,6 +1310,25 @@ def Hash_Digits(vlong,digs = HASHDEF):
         vhash = hashlib.sha256(json.dumps(vlong).encode("utf-8")).hexdigest()
     vn = int(vhash, 16) % (10 ** digs) 
     return vn
+
+def Ellipsis_Rep(lfull,lpart,ellimark = "..."):
+    """Replaces ellipsis from a partial list with the full data.
+    
+    The intent is to discard elems left and right of el, per their count.
+    Impossible to discern the position for multiple els.
+    If partial list is longer, will simply drop the el"""
+    # Index is not a major improvement in speed - linear,
+    # and lacks multielem, so disabled it.
+#     if len(ellimark) == 1: 
+#         try:
+#             idx = lpart.index(ellimark)
+#         except ValueError: # No elli.
+#             return lpart
+    if not islstup(ellimark):
+        ellimark = [ellimark]
+    idx = min([i for i,v in enumerate(lpart) if v in ellimark])
+    vret = lpart[:idx] + lfull[idx:len(lfull) + idx - len(lpart)] + lpart[idx + 1:]
+    return vret
 
 # Checks whether imported.
 if __name__ == '__main__':

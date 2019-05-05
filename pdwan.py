@@ -5,18 +5,19 @@ Created on 26/03/19
 
 @author: Symbiomatrix
 
-Todo:
-- Class for special pd tricks.
+@purpose: Pandas shenanigans.
 
-Features:
+Todo:
+More stuff.
 
 Future:
 
 Notes:
 
-Bugs:
+Bugs: See those marked below and workarounds.
 
 Version log:
+03/05/19 V0.7 Added date ceil / floor, sparse time conversion.
 30/04/19 V0.6 Added group (max row) selection, date + time type format, partial fillna.
 20/04/19 V0.5 Added cooldown.
 08/04/19 V0.4 Added period overlap, simple save frame.
@@ -92,7 +93,8 @@ uti.FDEFS.update({
 "Pddiric":{"group":("group",1),"weight":("weight",1)},
 "Pdolap":{"id":"id","tstart":"tstart","tend":"tend","rdur":"rdur",
           "tseq":None},
-"Pdmaxr":{"group":None,"maxcol":"maxcol","func":"idxmax","flocs":[],"fparms":dict()},
+"Pdmaxr":{"group":None,"maxcol":"maxcol","func":"idxmax",
+          "flocs":[],"fparms":dict(),"dedix":False},
 "Pdtrigcd":{"cdur":MIN,"group":None,"tstamp":"tstart", # Also kin.
             "pgroup":None,"pcd":NOTIME,"ptstamp":MINDT},
 })
@@ -604,12 +606,15 @@ class BmxFrame(pd.DataFrame):
         Parms: group = col per each max applied,
         maxcol = col which is supposed to be maxed,
         func + *flocs + **fparms = the comparison method.
-        (must return indices, such as idxmax, idxmin, head.)
+        (must return indices, such as idxmax, idxmin, head, tail.)
+        First, last = head or tail (1), these don't return idx at all.  
         Group defaults to index, but if there isn't one then picks global max.
         Mind, df must *not* be keyed in order for idxmax to work
         (mayhap iloc would suffice), other than def.
         It's just used as a col and the group later
-        assimilates it to the unique frame (keyed)."""
+        assimilates it to the unique frame (keyed).
+        Just for fun, these are equivalent calls:
+        func = "tail",flocs = 1 ; func = lambda x: x.tail(1),dedix = True."""
         rund = uti.Default_Dict("Pdmaxr",parms)
         if not uti.islstup(rund["flocs"]):
             rund["flocs"] = [rund["flocs"]]
@@ -620,9 +625,14 @@ class BmxFrame(pd.DataFrame):
         #vret = BmxFrame(df[idxnm].drop_duplicates(),columns = idxnm)
         #vret.set_index(idxnm,inplace = True)
         tidx = df.groupby(idxnm)[rund["maxcol"]]
-        func = getattr(tidx,rund["func"])
-        tidx = func(*rund["flocs"],**rund["fparms"])
-        if rund["func"] in GRPIDX:
+        if uti.isstr(rund["func"]): # Interpreted as method name. 
+            func = getattr(tidx,rund["func"])
+            tidx = func(*rund["flocs"],**rund["fparms"])
+        else: # Otherwise, a function which should handle the series.
+            func = rund["func"]
+            tidx = func(tidx,*rund["flocs"],**rund["fparms"])
+        if (rund["func"] in GRPIDX
+            or rund["dedix"]): # May force idx grab in custom funcs.
             tidx = tidx.index
         tgrp = df.loc[tidx]
         tgrp.set_index(idxnm,inplace = True)
@@ -695,6 +705,135 @@ class BmxFrame(pd.DataFrame):
         return self.apply(App_Format,1,fmt = fmt,indcast = indcast,nullstr = nullstr)
         #return self.apply(lambda x:fmt.format(**x),1)
     
+    def Ceil_Date(self,kin,scdt):
+        """Upper bound to a date series by scalar.
+        
+        Normal min doesn't work since the indices don't match.
+        Np min / max complains anent 'int-timestamp', yet won't permit converting either
+        (in a prior version, int cast seemed to work).
+        Currently, converting to a series works."""
+        vdt = self.Get_Key(kin)
+        serdt = pd.Series(pd.to_datetime(scdt))
+        return np.minimum(vdt,serdt)
+    
+    def Floor_Date(self,kin,scdt):
+        """Lower bound to a date series by scalar.
+        
+        Equiv to ceil."""
+        vdt = self.Get_Key(kin)
+        serdt = pd.Series(pd.to_datetime(scdt))
+        return np.maximum(vdt,serdt)
+    
+    def Date2Time_Sparse(self,kin,fmt = None,klean = False):
+        """Converts an array / col of dupe dates to time or lean frame.
+        
+        Col must be sorted asc to fill correctly.
+        In lean mode, each dupe is reduced to first, min, max, last;
+        Which preserves the graph for display, and far less demanding.
+        Send a key name for the value to be maxed in this case.
+        Originally intended for array of datetime64, that should work.
+        If format is not passed, will convert to actual time,
+        which aligns nicely in pyplot (despite its drawbacks - object?).
+        Creep: Lean form might be inefficient.
+        Stack to a predefined array with 4 cols for the types, along axis 1, 
+        and finally reshape to (-1,1);
+        then for time axis, pick every {dense} value (::dense), reshape to (-1,1),
+        tile (4,1) and reshape -1 - this will merge sequentially per row for both.
+        Fun format, named "caledfwelch" - min max only,
+        merge along axis 0 (or transpose)."""
+        vdt = self.Get_Key(kin) # Np -> pd is fast.
+        if klean:
+            # Kin must be referrable by name in this case.
+            vgrp = self.Group_Rows(group = vdt.name,maxcol = klean,
+                                   func = "head",flocs = 1) # Alt: first of group.
+            vgrp["skey"] = 1
+            vret = vgrp
+            vgrp = self.Group_Rows(group = vdt.name,maxcol = klean,
+                                   func = "idxmin")
+            vgrp["skey"] = 2
+            vret = vret.append(vgrp)
+            vgrp = self.Group_Rows(group = vdt.name,maxcol = klean,
+                                   func = "idxmax")
+            vgrp["skey"] = 3
+            vret = vret.append(vgrp)
+            vgrp = self.Group_Rows(group = vdt.name,maxcol = klean,
+                                   func = "tail",flocs = 1)
+            vgrp["skey"] = 4
+            vret = vret.append(vgrp)
+            # No index + col sort, so other options are np.lexsort,
+            # or 2 part + mergesort on the col which is stable.
+            vret.reset_index(inplace = True)
+            vret.sort_values([vdt.name,"skey"],inplace = True)
+            vret.set_index(vdt.name,inplace = True)
+        else:
+            self["tmp"] = pd.NaT
+            # Dt functions are slow by slow, the dupe reduction helps as filter is fast.
+            if fmt is not None:
+                self["tmp"] = App_Strftime(self.loc[vdt != vdt.shift(1),vdt.name],
+                                           date_format = fmt)
+            else:
+                self["tmp"] = self.loc[vdt != vdt.shift(1),vdt.name].dt.time
+            self["tmp"].ffill(inplace = True)
+            vret = self["tmp"]
+        return vret
+    
+    def Misc_Repo(self):
+        """Some other ad hoc function ideas.
+        
+        """
+#         -df.to_json(orient = "type") options:
+#         index = key is the main, cols inside named.
+#         columns = opposite of index, cols -> key.
+#         records = index is dropped (made into list), cols named.
+#         values = L2 only, no keys or col names whatsoever.
+#         table = "schema" header item defining col structure,
+#         but repeated in data (= records).
+#         DO NOT just apply json to a list of dfs!
+#         The string output must be matched manually.
+        # -Convert pd.NaT to None so that it can be json serialised.
+        # Necessary when multiple frames have to be merged; and also supports indent.
+        #json.dumps(df.where(df.notnull(),None).to_dict(orient="index"),indent = 4)
+        #df.to_json(orient = "index") # Alt if only one frame.
+        # -Nice shorthand for set, but generates warnings of implicit slice copy update.
+        # Note that update uses left join by index only (kinda crude method).
+        #df.update(func(df.filter)) == df.loc[:,df.filter.columns] = df[df.filter]
+        # -Old bug: In past versions (prolly), the timedelta didn't cancel out in df,
+        # as it did in series. Now both return floats.
+        #df[["tdur","tdur"]] / SEC
+        # Isoformat still not ported to .dt.
+        # -Old bug: Could not divide one timedelta by another - yielded error,
+        # rather than float ratio of duration. It works as expected now.
+        # Workaround was to divide both by 1 sec to obtain a float.
+        #df["tdur"] / (df["tdur"] - 30 * MIN)
+        # -Rearrange columns; warning, will create null cols if nonexistent.
+        #df.reindex(columns = ["col1","col2"])
+        # -Derive a timestamp from date (for its hours, mins and secs).
+        # "Time" type is a dead end - for example lacks any sort arithmetic.
+        #(serdt - pd.datetime.utcfromtimestamp(0)).dt.total_seconds()
+        # Derive time of day (hacky, my new type format is more elegant if looped):
+        #pd.Timedelta(pd.to_datetime(serdt).dt.strftime("%H:%M:%S"))
+        # -Bug: Timedelta type is quite sensitive. astype(np.timedelta64)
+        # or astype("timedelta64") will result in a float of seconds (ie e11).
+        # To get the expected timedelta, send astype("timedelta64[ns]")
+        # -Quick hack for date -> time along the same day:
+        #daydt = pd.to_datetime(to_dt(t[0]).strftime("%Y-%m-%d")) # Earliest day ts.
+        #df["puret"] = df["rawt"] - daydt 
+        # -?Bug: "Time" type is limited to checks, therefore arithmetic
+        # timedelta lacks any summary;
+        # Best is the altchecktact method whilst I wrote bug.
+        # [Dunno what this means exactly, but presumably issue with
+        # the inaccessibility of methods for "dt.time" col, eg sum.]
+        # -Moving average.
+        # N is window size (number of periods averaged,
+        # M (= N def) is number (-1) of nans until giving an output;
+        # if m < n, will divide value by the current count. 
+        # Fails (notimp) if applied to date, tdel etc.
+        #df.rolling(window = {n},min_periods = {m}).mean()
+        # -Top percentile (technically quantile).
+        # prc = 0.5 => median. Filters to numeric cols only,
+        # but can be forced to timedeltas.
+        #df.quantile(q = {prc})
+    
 # Checks whether imported.
 if __name__ == '__main__':
     print("hello world")
@@ -755,6 +894,13 @@ if __name__ == '__main__':
     df4.loc[0,"tdur"] = pd.NaT
     df4.loc[3,"tend"] = pd.NaT
     df4.loc[6,"tdur"] = df4.loc[6,"tdur"] - 53914 * SEC
+    df4["tstart"] = (df4.Ceil_Date(df4.Floor_Date(
+                        "tstart","2010-01-01 16:00"),
+                        "2010-01-01 16:30"))
+    df4["val"] = df4.Rand_Norm()
+    qktm = df4.Date2Time_Sparse("tstart",fmt = "%d %M-%H",klean = False)
+    dlean = df4.Date2Time_Sparse("tstart",fmt = "%d %M-%H",klean = "val")
+    print("Quick time conv and lean form:\n",qktm,"\n",dlean)
     df4.Type_Format("%y%m%d %H%M%S","%D days, %H hours, %M:%S",None)
     print("Datetime format:\n",df4[["id","tstart","tend","tdur"]])
     print("\nFin")
